@@ -9,16 +9,15 @@
   "keywords": [],
   "author": "geo",
   "license": "ISC",
- "dependencies": {
-  "@types/node": "^22.13.11",
-  "body-parser": "^2.2.0",
-  "cors": "^2.8.5",
-  "dotenv": "^16.4.5",
-  "express": "^5.1.0",
-  "jsonwebtoken": "^9.0.2",
-  "mongoose": "^8.0.0",
-  "mongodb": "^6.6.0"
-}
+  "dependencies": {
+    "@types/node": "^22.13.11",
+    "body-parser": "^2.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.0.0",
+    "mongodb": "^6.6.0"
+  }
 }
 
-}
