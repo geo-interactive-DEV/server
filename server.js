@@ -6,32 +6,44 @@ const path = require("path");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-const PORT = 3000;
-const JWT_SECRET = "joeisnotgay"; // Replace with env var or safer secret
+// Use Render's assigned port or fallback to 3000 for local dev
+const PORT = process.env.PORT || 3000;
+
+const JWT_SECRET = "joeisnotgay"; // Replace with env var or safer secret in production
 
 app.use(cors());
 app.use(bodyParser.json());
 
 const USERS_FILE = path.join(__dirname, "users.json");
 
-// Load or initialize users
+// Load or initialize users from JSON file on startup
 let users = [];
 if (fs.existsSync(USERS_FILE)) {
   try {
     users = JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
-  } catch {
+  } catch (err) {
+    console.error("Failed to parse users.json, initializing empty users array:", err);
     users = [];
   }
 } else {
-  fs.writeFileSync(USERS_FILE, JSON.stringify([]));
+  // If users.json doesn't exist, create an empty one
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify([]));
+  } catch (err) {
+    console.error("Failed to create users.json file:", err);
+  }
 }
 
+// Save users array back to JSON file
 function saveUsers() {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  } catch (err) {
+    console.error("Failed to save users:", err);
+  }
 }
 
-// In-memory chat messages store
-// For production, replace with database or persistent store
+// In-memory chat messages store — this data will be lost on restart
 let chatMessages = [];
 
 // Middleware to verify JWT token
@@ -49,7 +61,7 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// Register route
+// Register a new user
 app.post("/register", (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -58,12 +70,13 @@ app.post("/register", (req, res) => {
   if (users.find((u) => u.username === username)) {
     return res.status(400).json({ success: false, message: "Username already exists" });
   }
-  users.push({ username, password }); // WARNING: store hashed passwords in real apps
+  // WARNING: Storing passwords in plain text is insecure! Use hashing in production!
+  users.push({ username, password });
   saveUsers();
   res.json({ success: true, message: "User registered successfully" });
 });
 
-// Login route
+// Login existing user
 app.post("/login", (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
@@ -73,12 +86,11 @@ app.post("/login", (req, res) => {
   if (!user) {
     return res.status(401).json({ success: false, message: "Invalid credentials" });
   }
-  // Generate JWT token
   const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: "2h" });
   res.json({ success: true, token });
 });
 
-// Profile route
+// Get user profile
 app.get("/profile", authenticateToken, (req, res) => {
   const user = users.find((u) => u.username === req.user.username);
   if (!user) {
@@ -87,16 +99,13 @@ app.get("/profile", authenticateToken, (req, res) => {
   res.json({ success: true, username: user.username });
 });
 
-// Chat routes
-
-// Get last 50 messages (can add pagination later)
+// Get last 50 chat messages
 app.get("/chat/messages", authenticateToken, (req, res) => {
-  // Return last 50 messages in chronological order
   const recentMessages = chatMessages.slice(-50);
   res.json({ success: true, messages: recentMessages });
 });
 
-// Post a new message
+// Post a new chat message
 app.post("/chat/messages", authenticateToken, (req, res) => {
   const { message } = req.body;
   if (!message || typeof message !== "string" || message.trim() === "") {
@@ -109,12 +118,31 @@ app.post("/chat/messages", authenticateToken, (req, res) => {
   };
   chatMessages.push(msgObj);
 
-  // Optional: limit chatMessages array size to avoid memory issues
+  // Limit chatMessages array size to avoid memory issues
   if (chatMessages.length > 1000) chatMessages.shift();
 
   res.json({ success: true, message: "Message sent", data: msgObj });
 });
 
+// Add a simple home route to avoid 404 at root
+app.get("/", (req, res) => {
+  res.send("Server is running. Use API endpoints to interact.");
+});
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+
+/*
+IMPORTANT:
+
+- This server stores users in a JSON file, but Render's filesystem is ephemeral,
+  so any changes (like new registrations) will be lost on redeploy or restart.
+
+- For production, move user and chat storage to a persistent database such as
+  MongoDB Atlas, Firebase, or Supabase.
+
+- Passwords are stored in plain text here — NEVER do this in production.
+  Use bcrypt or similar hashing libraries to store passwords securely.
+
+*/
