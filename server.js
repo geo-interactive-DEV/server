@@ -2,47 +2,46 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const fs = require("fs");
-const path = require("path");
+const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcrypt");
 
 const app = express();
-const PORT = 3000; // fixed port as you requested
+const PORT = process.env.PORT || 3000;
 
-const JWT_SECRET = process.env.JWT_SECRET || "joeisnotgay"; // Use env var in prod
+const JWT_SECRET = process.env.JWT_SECRET || "joeisnotgay"; // Change this in production!
+const MONGO_URI = process.env.MONGO_URI; // Your MongoDB connection string
+
+if (!MONGO_URI) {
+  console.error("Error: MONGO_URI environment variable not set");
+  process.exit(1);
+}
 
 app.use(cors());
 app.use(bodyParser.json());
 
-// JSON FILE SETUP
-const USERS_FILE = path.join(__dirname, "users.json");
+// Connect to MongoDB
+mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => console.log("MongoDB connected"))
+  .catch((err) => {
+    console.error("MongoDB connection error:", err);
+    process.exit(1);
+  });
 
-let users = [];
-if (fs.existsSync(USERS_FILE)) {
-  try {
-    users = JSON.parse(fs.readFileSync(USERS_FILE, "utf8"));
-  } catch (err) {
-    console.error("Failed to parse users.json, initializing empty users array:", err);
-    users = [];
-  }
-} else {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify([]));
-  } catch (err) {
-    console.error("Failed to create users.json file:", err);
-  }
-}
+// Define User Schema with unique username
+const userSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  passwordHash: { type: String, required: true },
+});
 
-function saveUsers() {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-  } catch (err) {
-    console.error("Failed to save users:", err);
-  }
-}
+const chatSchema = new mongoose.Schema({
+  username: String,
+  message: String,
+  timestamp: { type: Date, default: Date.now },
+});
 
-// In-memory chat messages (reset on restart)
-let chatMessages = [];
+const User = mongoose.model("User", userSchema);
+const ChatMessage = mongoose.model("ChatMessage", chatSchema);
 
 // Middleware to verify JWT token
 function authenticateToken(req, res, next) {
@@ -62,66 +61,97 @@ function authenticateToken(req, res, next) {
 // --- ROUTES ---
 
 // Register
-app.post("/register", (req, res) => {
+app.post("/register", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ success: false, message: "Missing username or password" });
   }
-  if (users.find((u) => u.username === username)) {
-    return res.status(400).json({ success: false, message: "Username already exists" });
+  try {
+    const existingUser = await User.findOne({ username });
+    if (existingUser) return res.status(400).json({ success: false, message: "Username already exists" });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const newUser = new User({ username, passwordHash });
+    await newUser.save();
+
+    res.json({ success: true, message: "User registered successfully" });
+  } catch (err) {
+    console.error("Register error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
-  users.push({ username, password });
-  saveUsers();
-  res.json({ success: true, message: "User registered successfully" });
 });
 
 // Login
-app.post("/login", (req, res) => {
+app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ success: false, message: "Missing username or password" });
   }
-  const user = users.find((u) => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ success: false, message: "Invalid credentials" });
+  try {
+    const user = await User.findOne({ username });
+    if (!user) return res.status(401).json({ success: false, message: "Invalid credentials" });
 
-  const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: "2h" });
-  res.json({ success: true, token });
+    const validPassword = await bcrypt.compare(password, user.passwordHash);
+    if (!validPassword) return res.status(401).json({ success: false, message: "Invalid credentials" });
+
+    const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: "2h" });
+    res.json({ success: true, token });
+  } catch (err) {
+    console.error("Login error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
 });
 
 // Profile
-app.get("/profile", authenticateToken, (req, res) => {
-  const user = users.find((u) => u.username === req.user.username);
-  if (!user) return res.status(404).json({ success: false, message: "User not found" });
-  res.json({ success: true, username: user.username });
+app.get("/profile", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.user.username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    res.json({ success: true, username: user.username });
+  } catch (err) {
+    console.error("Profile error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
 });
 
 // Get last 50 chat messages
-app.get("/chat/messages", authenticateToken, (req, res) => {
-  const recentMessages = chatMessages.slice(-50);
-  res.json({ success: true, messages: recentMessages });
+app.get("/chat/messages", authenticateToken, async (req, res) => {
+  try {
+    const messages = await ChatMessage.find()
+      .sort({ timestamp: -1 })
+      .limit(50)
+      .lean();
+    res.json({ success: true, messages: messages.reverse() }); // oldest first
+  } catch (err) {
+    console.error("Get messages error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
 });
 
 // Post a new chat message
-app.post("/chat/messages", authenticateToken, (req, res) => {
+app.post("/chat/messages", authenticateToken, async (req, res) => {
   const { message } = req.body;
   if (!message || typeof message !== "string" || message.trim() === "") {
     return res.status(400).json({ success: false, message: "Invalid message" });
   }
-  const msgObj = {
-    username: req.user.username,
-    message: message.trim(),
-    timestamp: Date.now(),
-  };
-  chatMessages.push(msgObj);
-  if (chatMessages.length > 1000) chatMessages.shift();
-  res.json({ success: true, message: "Message sent", data: msgObj });
+  try {
+    const msgObj = new ChatMessage({
+      username: req.user.username,
+      message: message.trim(),
+    });
+    await msgObj.save();
+    res.json({ success: true, message: "Message sent", data: msgObj });
+  } catch (err) {
+    console.error("Save message error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
 });
 
 // Home route
 app.get("/", (req, res) => {
-  res.send("Server is running. Use API endpoints to interact.");
+  res.send("Server is running with MongoDB and JWT authentication.");
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}, MongoDB removed - JSON file mode only.`);
+  console.log(`Server running on port ${PORT}`);
 });
