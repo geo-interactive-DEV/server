@@ -28,10 +28,17 @@ mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
     process.exit(1);
   });
 
-// Define User Schema with unique username
+// Define User Schema with unique username and role field
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
   passwordHash: { type: String, required: true },
+  role: { type: String, default: "user" } // roles: user, admin, etc.
+});
+
+// Ban schema to track banned users
+const banSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  bannedUntil: { type: Date, required: true }
 });
 
 const chatSchema = new mongoose.Schema({
@@ -41,6 +48,7 @@ const chatSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model("User", userSchema);
+const Ban = mongoose.model("Ban", banSchema);
 const ChatMessage = mongoose.model("ChatMessage", chatSchema);
 
 // Middleware to verify JWT token
@@ -58,6 +66,13 @@ function authenticateToken(req, res, next) {
   });
 }
 
+// Helper to check if user is banned
+async function isUserBanned(username) {
+  const ban = await Ban.findOne({ username });
+  if (!ban) return false;
+  return ban.bannedUntil > new Date();
+}
+
 // --- ROUTES ---
 
 // Register
@@ -71,7 +86,7 @@ app.post("/register", async (req, res) => {
     if (existingUser) return res.status(400).json({ success: false, message: "Username already exists" });
 
     const passwordHash = await bcrypt.hash(password, 10);
-    const newUser = new User({ username, passwordHash });
+    const newUser = new User({ username, passwordHash, role: "user" });
     await newUser.save();
 
     res.json({ success: true, message: "User registered successfully" });
@@ -107,7 +122,7 @@ app.get("/profile", authenticateToken, async (req, res) => {
   try {
     const user = await User.findOne({ username: req.user.username });
     if (!user) return res.status(404).json({ success: false, message: "User not found" });
-    res.json({ success: true, username: user.username });
+    res.json({ success: true, username: user.username, role: user.role });
   } catch (err) {
     console.error("Profile error:", err);
     res.status(500).json({ success: false, message: "Server error" });
@@ -128,19 +143,75 @@ app.get("/chat/messages", authenticateToken, async (req, res) => {
   }
 });
 
-// Post a new chat message
+// Post a new chat message (with ban check and ban command)
 app.post("/chat/messages", authenticateToken, async (req, res) => {
   const { message } = req.body;
+  const username = req.user.username;
+
   if (!message || typeof message !== "string" || message.trim() === "") {
     return res.status(400).json({ success: false, message: "Invalid message" });
   }
+
+  // Check if user is banned
+  if (await isUserBanned(username)) {
+    return res.status(403).json({ success: false, message: "You are banned from chatting." });
+  }
+
+  // Check if message is a ban command
+  if (message.toLowerCase().startsWith("ban ")) {
+    // Only allow admins to ban
+    const user = await User.findOne({ username });
+    if (!user || user.role !== "admin") {
+      return res.status(403).json({ success: false, message: "You do not have permission to ban users." });
+    }
+
+    const parts = message.trim().split(/\s+/); // split by whitespace
+    // ban username [amount]
+    if (parts.length < 2) {
+      return res.status(400).json({ success: false, message: "Invalid ban command format. Usage: ban username [days]" });
+    }
+
+    const targetUser = parts[1];
+    let days = 7; // default ban days
+
+    if (parts.length >= 3) {
+      const parsedDays = parseInt(parts[2], 10);
+      if (!isNaN(parsedDays) && parsedDays > 0) {
+        days = parsedDays;
+      } else {
+        return res.status(400).json({ success: false, message: "Invalid number of days for ban." });
+      }
+    }
+
+    const bannedUntil = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+
+    // Upsert ban for the target user
+    await Ban.findOneAndUpdate(
+      { username: targetUser },
+      { username: targetUser, bannedUntil },
+      { upsert: true, new: true }
+    );
+
+    return res.json({ success: true, message: `${targetUser} banned for ${days} day(s).` });
+  }
+
+  // Normal message: save it
   try {
     const msgObj = new ChatMessage({
-      username: req.user.username,
+      username,
       message: message.trim(),
     });
     await msgObj.save();
-    res.json({ success: true, message: "Message sent", data: msgObj });
+    res.json({
+      success: true,
+      message: "Message sent",
+      data: {
+        username: msgObj.username,
+        message: msgObj.message,
+        timestamp: msgObj.timestamp,
+        _id: msgObj._id,
+      },
+    });
   } catch (err) {
     console.error("Save message error:", err);
     res.status(500).json({ success: false, message: "Server error" });
