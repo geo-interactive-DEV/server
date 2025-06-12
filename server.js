@@ -217,6 +217,52 @@ app.post("/chat/messages", authenticateToken, async (req, res) => {
     res.status(500).json({ success: false, message: "Server error" });
   }
 });
+sync function checkAdmin(req, res, next) {
+  const user = await User.findOne({ username: req.user.username });
+  if (!user || user.role !== "admin") {
+    return res.status(403).json({ success: false, message: "Admin only" });
+  }
+  next();
+}
+
+app.get("/admin/user/:username", authenticateToken, checkAdmin, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.params.username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    res.json({ username: user.username, role: user.role });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.get("/admin/ban/:username", authenticateToken, checkAdmin, async (req, res) => {
+  try {
+    const ban = await Ban.findOne({ username: req.params.username });
+    if (!ban) return res.status(404).json({ success: false, message: "No ban found" });
+    res.json({ username: ban.username, bannedUntil: ban.bannedUntil });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.get("/admin/chatlogs/:username", authenticateToken, checkAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+    const before = req.query.before ? new Date(req.query.before) : new Date();
+
+    const logs = await ChatMessage.find({
+      username: req.params.username,
+      timestamp: { $lt: before }
+    })
+    .sort({ timestamp: -1 })
+    .limit(limit)
+    .lean();
+
+    res.json({ logs });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 
 // Home route
 app.get("/", (req, res) => {
