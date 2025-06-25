@@ -9,7 +9,7 @@ const bcrypt = require("bcryptjs");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const JWT_SECRET = process.env.JWT_SECRET || "joeisnotgay"; // Change this in production!
+const JWT_SECRET = process.env.JWT_SECRET || "CHANGE_THIS_SECRET";
 const MONGO_URI = process.env.MONGO_URI;
 
 if (!MONGO_URI) {
@@ -32,7 +32,8 @@ mongoose.connect(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
 const userSchema = new mongoose.Schema({
   username: { type: String, unique: true, required: true },
   passwordHash: { type: String, required: true },
-  role: { type: String, default: "user" }
+  role: { type: String, default: "user" },
+  points: { type: Number, default: 0 }
 });
 
 const banSchema = new mongoose.Schema({
@@ -54,9 +55,7 @@ const ChatMessage = mongoose.model("ChatMessage", chatSchema);
 // Middleware
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
-  if (!authHeader) return res.status(401).json({ success: false, message: "No authorization header" });
-
-  const token = authHeader.split(" ")[1];
+  const token = authHeader?.split(" ")[1];
   if (!token) return res.status(401).json({ success: false, message: "No token provided" });
 
   jwt.verify(token, JWT_SECRET, (err, user) => {
@@ -80,6 +79,9 @@ async function isUserBanned(username) {
 }
 
 // Routes
+app.get("/", (req, res) => {
+  res.send("Server is running with MongoDB and JWT authentication.");
+});
 
 // Register
 app.post("/register", async (req, res) => {
@@ -93,7 +95,6 @@ app.post("/register", async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const newUser = new User({ username, passwordHash });
     await newUser.save();
-
     res.json({ success: true, message: "User registered successfully" });
   } catch (err) {
     console.error("Register error:", err);
@@ -108,10 +109,8 @@ app.post("/login", async (req, res) => {
 
   try {
     const user = await User.findOne({ username });
-    if (!user) return res.status(401).json({ success: false, message: "Invalid credentials" });
-
-    const validPassword = await bcrypt.compare(password, user.passwordHash);
-    if (!validPassword) return res.status(401).json({ success: false, message: "Invalid credentials" });
+    if (!user || !(await bcrypt.compare(password, user.passwordHash)))
+      return res.status(401).json({ success: false, message: "Invalid credentials" });
 
     const token = jwt.sign({ username: user.username }, JWT_SECRET, { expiresIn: "2h" });
     res.json({ success: true, token });
@@ -132,7 +131,55 @@ app.get("/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// Chat: Get messages
+// Points
+app.get("/points", authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.user.username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+    res.json({ success: true, points: user.points });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.post("/points/earn", authenticateToken, async (req, res) => {
+  const amount = parseInt(req.body.amount, 10) || 10;
+  if (amount < 1) return res.status(400).json({ success: false, message: "Invalid amount" });
+
+  try {
+    const user = await User.findOneAndUpdate(
+      { username: req.user.username },
+      { $inc: { points: amount } },
+      { new: true }
+    );
+    res.json({ success: true, message: `Earned ${amount} points`, points: user.points });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.post("/points/spend", authenticateToken, async (req, res) => {
+  const cost = parseInt(req.body.cost, 10);
+  const rewardName = req.body.reward || "reward";
+
+  if (!cost || cost < 1) return res.status(400).json({ success: false, message: "Invalid cost" });
+
+  try {
+    const user = await User.findOne({ username: req.user.username });
+    if (!user) return res.status(404).json({ success: false, message: "User not found" });
+
+    if (user.points < cost)
+      return res.status(400).json({ success: false, message: "Not enough points" });
+
+    user.points -= cost;
+    await user.save();
+    res.json({ success: true, message: `Redeemed ${rewardName}`, points: user.points });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Chat Messages
 app.get("/chat/messages", authenticateToken, async (req, res) => {
   try {
     const messages = await ChatMessage.find().sort({ timestamp: -1 }).limit(50).lean();
@@ -142,46 +189,24 @@ app.get("/chat/messages", authenticateToken, async (req, res) => {
   }
 });
 
-// Chat: Post message or ban command
 app.post("/chat/messages", authenticateToken, async (req, res) => {
   const { message } = req.body;
   const username = req.user.username;
 
-  if (!message || typeof message !== "string" || message.trim() === "") {
-    return res.status(400).json({ success: false, message: "Invalid message" });
-  }
+  if (!message?.trim()) return res.status(400).json({ success: false, message: "Invalid message" });
+  if (await isUserBanned(username)) return res.status(403).json({ success: false, message: "You are banned." });
 
-  if (await isUserBanned(username)) {
-    return res.status(403).json({ success: false, message: "You are banned from chatting." });
-  }
-
-  // Ban command
   if (message.toLowerCase().startsWith("ban ")) {
     const user = await User.findOne({ username });
-    if (!user || user.role !== "admin") {
-      return res.status(403).json({ success: false, message: "Admin only." });
-    }
+    if (!user || user.role !== "admin") return res.status(403).json({ success: false, message: "Admin only" });
 
-    const parts = message.trim().split(/\s+/);
-    if (parts.length < 2) {
-      return res.status(400).json({ success: false, message: "Format: ban username [days]" });
-    }
-
-    const targetUser = parts[1];
-    let days = 7;
-
-    if (parts[2]) {
-      const d = parseInt(parts[2], 10);
-      if (!isNaN(d) && d > 0) days = d;
-    }
-
+    const [_, target, daysStr] = message.trim().split(/\s+/);
+    const days = parseInt(daysStr, 10) || 7;
     const bannedUntil = new Date(Date.now() + days * 86400000);
-    await Ban.findOneAndUpdate({ username: targetUser }, { username: targetUser, bannedUntil }, { upsert: true, new: true });
-
-    return res.json({ success: true, message: `${targetUser} banned for ${days} day(s).` });
+    await Ban.findOneAndUpdate({ username: target }, { username: target, bannedUntil }, { upsert: true });
+    return res.json({ success: true, message: `${target} banned for ${days} days.` });
   }
 
-  // Normal message
   try {
     const msgObj = new ChatMessage({ username, message: message.trim() });
     await msgObj.save();
@@ -191,7 +216,7 @@ app.post("/chat/messages", authenticateToken, async (req, res) => {
   }
 });
 
-// Admin: Get full user info
+// Admin routes
 app.get("/admin/user/:username", authenticateToken, checkAdmin, async (req, res) => {
   try {
     const username = req.params.username;
@@ -205,7 +230,6 @@ app.get("/admin/user/:username", authenticateToken, checkAdmin, async (req, res)
       username: user.username,
       role: user.role,
       banned: !!ban && ban.bannedUntil > new Date(),
-      banReason: "Chat Ban", // optional custom field
       banExpiry: ban ? ban.bannedUntil : null,
       logs: logs.map(log => `[${new Date(log.timestamp).toLocaleString()}] ${log.message}`)
     });
@@ -214,7 +238,6 @@ app.get("/admin/user/:username", authenticateToken, checkAdmin, async (req, res)
   }
 });
 
-// Admin: View only ban info
 app.get("/admin/ban/:username", authenticateToken, checkAdmin, async (req, res) => {
   try {
     const ban = await Ban.findOne({ username: req.params.username });
@@ -225,26 +248,17 @@ app.get("/admin/ban/:username", authenticateToken, checkAdmin, async (req, res) 
   }
 });
 
-// Admin: View chat logs
 app.get("/admin/chatlogs/:username", authenticateToken, checkAdmin, async (req, res) => {
   try {
     const limit = Math.min(parseInt(req.query.limit) || 10, 50);
     const before = req.query.before ? new Date(req.query.before) : new Date();
-
-    const logs = await ChatMessage.find({
-      username: req.params.username,
-      timestamp: { $lt: before }
-    }).sort({ timestamp: -1 }).limit(limit).lean();
+    const logs = await ChatMessage.find({ username: req.params.username, timestamp: { $lt: before } })
+      .sort({ timestamp: -1 }).limit(limit).lean();
 
     res.json({ logs });
   } catch (err) {
     res.status(500).json({ success: false, message: "Server error" });
   }
-});
-
-// Home route
-app.get("/", (req, res) => {
-  res.send("Server is running with MongoDB and JWT authentication.");
 });
 
 app.listen(PORT, () => {
